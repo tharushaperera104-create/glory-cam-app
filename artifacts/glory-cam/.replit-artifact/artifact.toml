@@ -1,0 +1,27 @@
+kind = "mobile"
+previewPath = "/"
+title = "Glory Cam"
+version = "1.0.0"
+id = "artifacts/glory-cam"
+router = "expo-domain"
+
+[[integratedSkills]]
+name = "expo"
+version = "1.0.0"
+
+[[services]]
+ensurePreviewReachable = "/status"
+name = "expo"
+paths = [ "/" ]
+localPort = 22746
+
+[services.development]
+run = "pnpm --filter @workspace/glory-cam run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/glory-cam", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/glory-cam", "run", "serve" ]
+
+[services.env]
+PORT = "22746"
+BASE_PATH = "/"
