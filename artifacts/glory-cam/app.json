@@ -1,0 +1,70 @@
+{
+  "expo": {
+    "name": "Glory Cam",
+    "slug": "glory-cam",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "glory-cam",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#000000"
+    },
+    "ios": {
+      "icon": "./assets/images/icon.png",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Glory Cam needs camera access to take photos.",
+        "NSPhotoLibraryAddUsageDescription": "Glory Cam saves photos to your library.",
+        "NSPhotoLibraryUsageDescription": "Glory Cam reads photos from your library."
+      }
+    },
+    "android": {
+      "icon": "./assets/images/icon.png",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/icon.png",
+        "backgroundColor": "#000000"
+      },
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_EXTERNAL_STORAGE"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/images/icon.png"
+    },
+    "plugins": [
+      [
+        "expo-router",
+        {
+          "origin": "https://replit.com/"
+        }
+      ],
+      "expo-font",
+      "expo-web-browser",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Glory Cam needs camera access to take photos."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Glory Cam saves your photos to the gallery.",
+          "savePhotosPermission": "Glory Cam saves photos to your gallery.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}
