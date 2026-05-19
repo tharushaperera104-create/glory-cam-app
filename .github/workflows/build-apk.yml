@@ -25,7 +25,7 @@ jobs:
           version: latest
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --no-frozen-lockfile --ignore-scripts
 
       - name: Install EAS CLI
         run: npm install -g eas-cli
