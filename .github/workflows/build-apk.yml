@@ -30,6 +30,12 @@ jobs:
       - name: Install EAS CLI
         run: npm install -g eas-cli
 
+      - name: Initialize EAS project
+        working-directory: artifacts/glory-cam
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: eas init --non-interactive
+
       - name: Build APK with EAS
         working-directory: artifacts/glory-cam
         env:
@@ -40,5 +46,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: glory-cam-apk
-          path: artifacts/glory-cam/*.apk
+          path: "**/*.apk"
           retention-days: 30
