@@ -34,6 +34,10 @@ outputType = "webview"
 localPort = 5000
 externalPort = 80
 
+[[ports]]
+localPort = 22746
+externalPort = 3000
+
 [deployment]
 deploymentTarget = "autoscale"
 run = ["node", "artifacts/glory-cam/server/serve.js"]
