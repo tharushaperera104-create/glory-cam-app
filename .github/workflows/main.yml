@@ -1,5 +1,8 @@
-name: Build Glory Cam APK
-
+name: Initialize EAS project
+        working-directory: artifacts/glory-cam
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: eas init --non-interactive --force
 on:
   push:
     branches: [main]
