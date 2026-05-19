@@ -17,12 +17,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: latest
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
@@ -40,5 +40,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: glory-cam-apk
-          path: "**/*.apk"
+          path: artifacts/glory-cam/*.apk
           retention-days: 30
