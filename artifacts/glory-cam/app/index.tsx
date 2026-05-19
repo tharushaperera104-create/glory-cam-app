@@ -60,13 +60,19 @@ export default function CameraScreen() {
   const [zoom, setZoom] = useState(0);
   const [lastPhoto, setLastPhoto] = useState<string | null>(null);
   const [appState, setAppState] = useState<AppState>("idle");
-  const [scanSecondsLeft, setScanSecondsLeft] = useState(5);
+  const [scanSecondsLeft, setScanSecondsLeft] = useState(0);
   const [timerSecondsLeft, setTimerSecondsLeft] = useState(0);
   const [frameCount, setFrameCount] = useState(0);
   const [burstCount, setBurstCount] = useState(0);
   const [currentStep, setCurrentStep] = useState<ProcessStep | null>(null);
   const [completedSteps, setCompletedSteps] = useState<ProcessStep[]>([]);
   const [errorMsg, setErrorMsg] = useState("");
+
+  // Tap-to-focus state
+  const [focusPoint, setFocusPoint] = useState<{ x: number; y: number } | null>(null);
+  const focusAnim = useRef(new Animated.Value(0)).current;
+  const focusScaleAnim = useRef(new Animated.Value(1.4)).current;
+  const focusAnimRef = useRef<Animated.CompositeAnimation | null>(null);
 
   const baseZoom = useRef(0);
   const scanLineAnim = useRef(new Animated.Value(0)).current;
@@ -75,9 +81,11 @@ export default function CameraScreen() {
   const burstHoldRef = useRef(false);
 
   const isNight = mode === "NIGHT";
-  const SCAN_DURATION = isNight ? 8000 : 5000;
-  const MAX_FRAMES = isNight ? 6 : 4;
-  const FRAME_INTERVAL = isNight ? 1300 : 1100;
+
+  // Night: 2 frames / 3s — other modes: 1 frame / 1.5s
+  const SCAN_DURATION = isNight ? 3000 : 1500;
+  const MAX_FRAMES = isNight ? 2 : 1;
+  const FRAME_INTERVAL = isNight ? 1400 : 0;
 
   const topPad = Platform.OS === "web" ? insets.top + 67 : insets.top;
   const bottomPad = Platform.OS === "web" ? insets.bottom + 34 : insets.bottom;
@@ -87,12 +95,11 @@ export default function CameraScreen() {
     if (isNight) setFlash("off");
   }, [isNight]);
 
-  // Request media permission on mount
   useEffect(() => {
     if (!mediaPermission?.granted) requestMediaPermission();
   }, []);
 
-  // Pinch-to-zoom — only on the camera view, NOT full screen
+  // Pinch-to-zoom
   const pinchGesture = useMemo(
     () =>
       Gesture.Pinch()
@@ -113,12 +120,37 @@ export default function CameraScreen() {
     })
   ).current;
 
+  // Tap-to-focus handler
+  const handleCameraTap = useCallback((event: any) => {
+    if (appState !== "idle") return;
+    const x = event?.nativeEvent?.x ?? event?.nativeEvent?.locationX ?? 0;
+    const y = event?.nativeEvent?.y ?? event?.nativeEvent?.locationY ?? 0;
+    if (!x && !y) return;
+
+    focusAnimRef.current?.stop();
+    setFocusPoint({ x, y });
+    focusAnim.setValue(0);
+    focusScaleAnim.setValue(1.4);
+
+    Haptics.selectionAsync();
+
+    focusAnimRef.current = Animated.sequence([
+      Animated.parallel([
+        Animated.timing(focusAnim, { toValue: 1, duration: 180, useNativeDriver: true }),
+        Animated.timing(focusScaleAnim, { toValue: 1, duration: 220, useNativeDriver: true }),
+      ]),
+      Animated.delay(900),
+      Animated.timing(focusAnim, { toValue: 0, duration: 300, useNativeDriver: true }),
+    ]);
+    focusAnimRef.current.start(() => setFocusPoint(null));
+  }, [appState, focusAnim, focusScaleAnim]);
+
   const startScanAnimation = useCallback(() => {
     scanLineAnim.setValue(0);
     scanAnimRef.current = Animated.loop(
       Animated.sequence([
-        Animated.timing(scanLineAnim, { toValue: 1, duration: 1400, useNativeDriver: true }),
-        Animated.timing(scanLineAnim, { toValue: 0, duration: 1400, useNativeDriver: true }),
+        Animated.timing(scanLineAnim, { toValue: 1, duration: 700, useNativeDriver: true }),
+        Animated.timing(scanLineAnim, { toValue: 0, duration: 700, useNativeDriver: true }),
       ])
     );
     scanAnimRef.current.start();
@@ -154,7 +186,6 @@ export default function CameraScreen() {
   const doScan = useCallback(async () => {
     if (!cameraRef.current) return;
 
-    // Ensure media permission
     if (!mediaPermission?.granted) {
       const { granted } = await requestMediaPermission();
       if (!granted) {
@@ -170,43 +201,47 @@ export default function CameraScreen() {
     setCompletedSteps([]);
     setCurrentStep(null);
     setErrorMsg("");
-    let remaining = Math.round(SCAN_DURATION / 1000);
+
+    const scanSecs = Math.round(SCAN_DURATION / 1000);
+    let remaining = scanSecs;
     setScanSecondsLeft(remaining);
 
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     startScanAnimation();
 
-    // Capture frames as file URIs (more reliable on native than base64)
     const capturedUris: string[] = [];
     let framesDone = 0;
 
     const countdownId = setInterval(() => {
       remaining -= 1;
-      setScanSecondsLeft(remaining);
+      setScanSecondsLeft(Math.max(0, remaining));
     }, 1000);
 
     const captureFrame = async () => {
       if (!cameraRef.current || framesDone >= MAX_FRAMES) return;
       try {
         const photo = await cameraRef.current.takePictureAsync({
-          quality: 0.8,
+          quality: 0.4,
           exif: false,
-          // NO base64: true — use URI instead, read file after
         });
         if (photo?.uri) {
           capturedUris.push(photo.uri);
           framesDone++;
           setFrameCount(framesDone);
-          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
         }
       } catch { /* ignore single frame failure */ }
     };
 
+    // Capture first frame immediately
     await captureFrame();
+
+    // Schedule additional frames for NIGHT mode
     const frameTimers: ReturnType<typeof setTimeout>[] = [];
     for (let i = 1; i < MAX_FRAMES; i++) {
       frameTimers.push(setTimeout(() => captureFrame(), i * FRAME_INTERVAL));
     }
+
     await new Promise<void>((r) => setTimeout(r, SCAN_DURATION));
     clearInterval(countdownId);
     frameTimers.forEach(clearTimeout);
@@ -227,7 +262,8 @@ export default function CameraScreen() {
       let originalUri: string = capturedUris[0];
 
       if (Platform.OS !== "web" && processorRef.current) {
-        // Read URIs as base64 for WebView processing
+        // Read captured frames as base64 for WebView processing
+        // With 1-2 frames at quality 0.4 the payload stays well under limits
         const base64Frames = await Promise.all(
           capturedUris.map((uri) =>
             FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 })
@@ -273,25 +309,23 @@ export default function CameraScreen() {
 
         setLastPhoto(finalUri);
       } else {
-        // Web or no processor — save raw photo
         await saveRawPhotoFallback(capturedUris[0]);
       }
 
       setCurrentStep("done");
       setCompletedSteps((prev) => [...prev, "done"]);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      await new Promise<void>((r) => setTimeout(r, 1200));
+      await new Promise<void>((r) => setTimeout(r, 900));
       setAppState("done");
-      await new Promise<void>((r) => setTimeout(r, 700));
+      await new Promise<void>((r) => setTimeout(r, 500));
 
     } catch (err) {
-      // Fallback: even if AI processing fails, save the raw first frame
       const saved = await saveRawPhotoFallback(capturedUris[0]);
       if (saved) {
         setCurrentStep("done");
         setCompletedSteps((prev) => [...prev, "done"]);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        await new Promise<void>((r) => setTimeout(r, 1000));
+        await new Promise<void>((r) => setTimeout(r, 900));
       } else {
         setErrorMsg("Save failed — check storage permission");
         setAppState("error");
@@ -414,7 +448,7 @@ export default function CameraScreen() {
       <StatusBar style="light" hidden />
       <ImageProcessorView ref={processorRef} />
 
-      {/* Viewfinder — GestureDetector ONLY covers the camera, not UI */}
+      {/* Viewfinder with pinch-to-zoom + tap-to-focus */}
       <GestureDetector gesture={pinchGesture}>
         <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
           <CameraView
@@ -424,9 +458,26 @@ export default function CameraScreen() {
             flash={flash}
             zoom={zoom}
             enableTorch={torch}
+            onTap={handleCameraTap}
           />
         </View>
       </GestureDetector>
+
+      {/* Tap-to-focus ring */}
+      {focusPoint && (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.focusRing,
+            {
+              left: focusPoint.x - 36,
+              top: focusPoint.y - 36,
+              opacity: focusAnim,
+              transform: [{ scale: focusScaleAnim }],
+            },
+          ]}
+        />
+      )}
 
       {/* Night vignette */}
       {isNight && (
@@ -535,7 +586,7 @@ export default function CameraScreen() {
                 {isNight ? "NIGHT SCAN" : "SCANNING"}
               </Text>
             </View>
-            <Text style={styles.scanTimer}>{scanSecondsLeft}s</Text>
+            {isNight && <Text style={styles.scanTimer}>{scanSecondsLeft}s</Text>}
           </View>
           <View style={[styles.scanInfoBottom, { bottom: bottomPad + 160 }]}>
             <Text style={styles.scanHint}>
@@ -635,10 +686,9 @@ export default function CameraScreen() {
         </View>
       )}
 
-      {/* ── BOTTOM CONTROLS — rendered last so they are on top of everything ── */}
+      {/* ── BOTTOM CONTROLS ── */}
       {isIdle && (
         <View style={[styles.bottomBar, { paddingBottom: bottomPad + 16 }]}>
-          {/* Gallery thumbnail — dedicated TouchableOpacity, z-index handled by render order */}
           <TouchableOpacity
             style={styles.thumbnailBtn}
             onPress={goToGallery}
@@ -726,6 +776,17 @@ const styles = StyleSheet.create({
   permBtn: { marginTop: 8, backgroundColor: "#00BFFF", paddingHorizontal: 36, paddingVertical: 14, borderRadius: 30 },
   permBtnText: { color: "#000", fontSize: 16, fontWeight: "700" },
 
+  focusRing: {
+    position: "absolute",
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    borderWidth: 2,
+    borderColor: "#FFD700",
+    backgroundColor: "transparent",
+    zIndex: 15,
+  },
+
   nightVignette: { ...StyleSheet.absoluteFillObject, borderWidth: 40, borderColor: "rgba(0,0,50,0.18)" },
 
   gridOverlay: { zIndex: 5 },
@@ -812,7 +873,6 @@ const styles = StyleSheet.create({
   modeDot: { width: 4, height: 4, borderRadius: 2, backgroundColor: "#00BFFF", marginTop: 3 },
   modeDotNight: { backgroundColor: "#FFD700" },
 
-  // Bottom bar — rendered last = highest touch priority on Android
   bottomBar: { position: "absolute", bottom: 0, left: 0, right: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 32, zIndex: 25 },
   thumbnailBtn: { width: 58, height: 58, borderRadius: 12, overflow: "hidden", borderWidth: 2, borderColor: "rgba(255,255,255,0.4)" },
   thumbnail: { width: "100%", height: "100%" },

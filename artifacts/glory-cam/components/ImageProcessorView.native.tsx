@@ -63,7 +63,7 @@ function processFrames(frames, mode, filter, quality, exposure) {
   var origCtx = origCanvas.getContext('2d');
   var images = [];
   var loaded = 0;
-  var SCALE = (quality === 'Max') ? 0.7 : 0.5;
+  var SCALE = (quality === 'Max') ? 0.45 : 0.32;
 
   for (var i = 0; i < frames.length; i++) {
     (function(idx) {
