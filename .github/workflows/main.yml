@@ -24,11 +24,17 @@ jobs:
         with:
           version: latest
 
-      - name: Install dependencies (root)
+      - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
       - name: Install EAS CLI
         run: npm install -g eas-cli
+
+      - name: Initialize EAS project
+        working-directory: artifacts/glory-cam
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: eas init --non-interactive --force
 
       - name: Build APK with EAS
         working-directory: artifacts/glory-cam
