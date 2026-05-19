@@ -6,10 +6,10 @@ import * as MediaLibrary from "expo-media-library";
 import { router } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import React, {
-  useRef, useState, useCallback, useEffect, useMemo, useReducer,
+  useRef, useState, useCallback, useEffect, useMemo,
 } from "react";
 import {
-  Animated, Dimensions, Image, PanResponder, Platform, Pressable,
+  Animated, Dimensions, Image, PanResponder, Platform,
   ScrollView, StyleSheet, Text, TouchableOpacity, View,
 } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
@@ -36,7 +36,7 @@ const STEPS: { key: ProcessStep; label: string }[] = [
   { key: "done", label: "Saved to gallery" },
 ];
 
-type AppState = "idle" | "timer" | "scanning" | "burst" | "processing" | "done";
+type AppState = "idle" | "timer" | "scanning" | "burst" | "processing" | "done" | "error";
 
 export default function CameraScreen() {
   const insets = useSafeAreaInsets();
@@ -66,6 +66,7 @@ export default function CameraScreen() {
   const [burstCount, setBurstCount] = useState(0);
   const [currentStep, setCurrentStep] = useState<ProcessStep | null>(null);
   const [completedSteps, setCompletedSteps] = useState<ProcessStep[]>([]);
+  const [errorMsg, setErrorMsg] = useState("");
 
   const baseZoom = useRef(0);
   const scanLineAnim = useRef(new Animated.Value(0)).current;
@@ -81,13 +82,17 @@ export default function CameraScreen() {
   const topPad = Platform.OS === "web" ? insets.top + 67 : insets.top;
   const bottomPad = Platform.OS === "web" ? insets.bottom + 34 : insets.bottom;
 
-  // Auto-enable torch in night mode
   useEffect(() => {
     setTorch(isNight);
     if (isNight) setFlash("off");
   }, [isNight]);
 
-  // Pinch-to-zoom
+  // Request media permission on mount
+  useEffect(() => {
+    if (!mediaPermission?.granted) requestMediaPermission();
+  }, []);
+
+  // Pinch-to-zoom — only on the camera view, NOT full screen
   const pinchGesture = useMemo(
     () =>
       Gesture.Pinch()
@@ -99,7 +104,6 @@ export default function CameraScreen() {
     [zoom]
   );
 
-  // Exposure PanResponder
   const exposurePR = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
@@ -125,24 +129,55 @@ export default function CameraScreen() {
     scanLineAnim.setValue(0);
   }, [scanLineAnim]);
 
+  const saveRawPhotoFallback = useCallback(async (photoUri: string) => {
+    try {
+      const ts = Date.now();
+      const destUri = `${FileSystem.cacheDirectory}glorycam_raw_${ts}.jpg`;
+      await FileSystem.copyAsync({ from: photoUri, to: destUri });
+      const asset = await MediaLibrary.createAssetAsync(destUri);
+      await MediaLibrary.createAlbumAsync("Glory Cam", asset, false);
+      await addPhoto({
+        id: String(ts),
+        processedUri: destUri,
+        originalUri: destUri,
+        timestamp: ts,
+        mode,
+        filter: "Natural",
+      });
+      setLastPhoto(destUri);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [mode]);
+
   const doScan = useCallback(async () => {
     if (!cameraRef.current) return;
+
+    // Ensure media permission
     if (!mediaPermission?.granted) {
       const { granted } = await requestMediaPermission();
-      if (!granted) return;
+      if (!granted) {
+        setErrorMsg("Gallery permission denied");
+        setAppState("error");
+        setTimeout(() => setAppState("idle"), 3000);
+        return;
+      }
     }
 
     setAppState("scanning");
     setFrameCount(0);
     setCompletedSteps([]);
     setCurrentStep(null);
+    setErrorMsg("");
     let remaining = Math.round(SCAN_DURATION / 1000);
     setScanSecondsLeft(remaining);
 
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     startScanAnimation();
 
-    const capturedFrames: string[] = [];
+    // Capture frames as file URIs (more reliable on native than base64)
+    const capturedUris: string[] = [];
     let framesDone = 0;
 
     const countdownId = setInterval(() => {
@@ -154,15 +189,17 @@ export default function CameraScreen() {
       if (!cameraRef.current || framesDone >= MAX_FRAMES) return;
       try {
         const photo = await cameraRef.current.takePictureAsync({
-          quality: 0.75, base64: true, exif: false,
+          quality: 0.8,
+          exif: false,
+          // NO base64: true — use URI instead, read file after
         });
-        if (photo?.base64) {
-          capturedFrames.push(photo.base64);
+        if (photo?.uri) {
+          capturedUris.push(photo.uri);
           framesDone++;
           setFrameCount(framesDone);
           Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
         }
-      } catch { /* ignore */ }
+      } catch { /* ignore single frame failure */ }
     };
 
     await captureFrame();
@@ -175,68 +212,104 @@ export default function CameraScreen() {
     frameTimers.forEach(clearTimeout);
     stopScanAnimation();
 
-    if (!capturedFrames.length) { setAppState("idle"); return; }
+    if (!capturedUris.length) {
+      setErrorMsg("Could not capture photo — try again");
+      setAppState("error");
+      setTimeout(() => setAppState("idle"), 3000);
+      return;
+    }
 
     setAppState("processing");
     setCurrentStep("noise");
 
     try {
-      let processed: string;
-      let original: string;
+      let finalUri: string;
+      let originalUri: string = capturedUris[0];
 
-      if (Platform.OS === "web" || !processorRef.current) {
-        processed = capturedFrames[0];
-        original = capturedFrames[0];
-      } else {
+      if (Platform.OS !== "web" && processorRef.current) {
+        // Read URIs as base64 for WebView processing
+        const base64Frames = await Promise.all(
+          capturedUris.map((uri) =>
+            FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 })
+          )
+        );
+
         const result = await processorRef.current.process(
-          capturedFrames,
+          base64Frames,
           (step) => {
             setCurrentStep(step);
             setCompletedSteps((prev) => prev.includes(step) ? prev : [...prev, step]);
           },
           { mode, filter, quality, exposure }
         );
-        processed = result.processed;
-        original = result.original;
+
+        const ts = Date.now();
+        const processedPath = `${FileSystem.cacheDirectory}glorycam_p_${ts}.jpg`;
+        const origPath = `${FileSystem.cacheDirectory}glorycam_o_${ts}.jpg`;
+
+        await Promise.all([
+          FileSystem.writeAsStringAsync(processedPath, result.processed, {
+            encoding: FileSystem.EncodingType.Base64,
+          }),
+          FileSystem.writeAsStringAsync(origPath, result.original, {
+            encoding: FileSystem.EncodingType.Base64,
+          }),
+        ]);
+
+        finalUri = processedPath;
+        originalUri = origPath;
+
+        const asset = await MediaLibrary.createAssetAsync(finalUri);
+        await MediaLibrary.createAlbumAsync("Glory Cam", asset, false);
+
+        await addPhoto({
+          id: String(ts),
+          processedUri: finalUri,
+          originalUri,
+          timestamp: ts,
+          mode,
+          filter,
+        });
+
+        setLastPhoto(finalUri);
+      } else {
+        // Web or no processor — save raw photo
+        await saveRawPhotoFallback(capturedUris[0]);
       }
 
       setCurrentStep("done");
-      const ts = Date.now();
-      const processedUri = FileSystem.cacheDirectory + `glorycam_p_${ts}.jpg`;
-      const originalUri = FileSystem.cacheDirectory + `glorycam_o_${ts}.jpg`;
-      await Promise.all([
-        FileSystem.writeAsStringAsync(processedUri, processed, { encoding: FileSystem.EncodingType.Base64 }),
-        FileSystem.writeAsStringAsync(originalUri, original, { encoding: FileSystem.EncodingType.Base64 }),
-      ]);
-
-      const asset = await MediaLibrary.createAssetAsync(processedUri);
-      await MediaLibrary.createAlbumAsync("Glory Cam", asset, false);
-
-      await addPhoto({
-        id: String(ts),
-        processedUri,
-        originalUri,
-        timestamp: ts,
-        mode,
-        filter,
-      });
-
-      setLastPhoto(processedUri);
-      setCompletedSteps((prev) => prev.includes("done") ? prev : [...prev, "done"]);
+      setCompletedSteps((prev) => [...prev, "done"]);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       await new Promise<void>((r) => setTimeout(r, 1200));
       setAppState("done");
       await new Promise<void>((r) => setTimeout(r, 700));
-    } catch { /* ignore */ }
-    finally { setAppState("idle"); setCurrentStep(null); }
+
+    } catch (err) {
+      // Fallback: even if AI processing fails, save the raw first frame
+      const saved = await saveRawPhotoFallback(capturedUris[0]);
+      if (saved) {
+        setCurrentStep("done");
+        setCompletedSteps((prev) => [...prev, "done"]);
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        await new Promise<void>((r) => setTimeout(r, 1000));
+      } else {
+        setErrorMsg("Save failed — check storage permission");
+        setAppState("error");
+        await new Promise<void>((r) => setTimeout(r, 2500));
+      }
+    } finally {
+      setAppState("idle");
+      setCurrentStep(null);
+    }
   }, [
     mediaPermission, requestMediaPermission, startScanAnimation, stopScanAnimation,
     mode, filter, quality, exposure, SCAN_DURATION, MAX_FRAMES, FRAME_INTERVAL,
+    saveRawPhotoFallback,
   ]);
 
   // Burst mode
   const doBurst = useCallback(async () => {
-    if (!cameraRef.current) return;
+    if (!cameraRef.current || appState !== "idle") return;
     burstHoldRef.current = true;
     setAppState("burst");
     setBurstCount(0);
@@ -244,7 +317,7 @@ export default function CameraScreen() {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     while (burstHoldRef.current && count < 20) {
       try {
-        const p = await cameraRef.current.takePictureAsync({ quality: 0.85, base64: false, exif: false });
+        const p = await cameraRef.current.takePictureAsync({ quality: 0.85, exif: false });
         if (p?.uri) {
           const asset = await MediaLibrary.createAssetAsync(p.uri);
           await MediaLibrary.createAlbumAsync("Glory Cam", asset, false);
@@ -257,12 +330,12 @@ export default function CameraScreen() {
     }
     setAppState("idle");
     setBurstCount(0);
-  }, []);
+  }, [appState]);
 
   const stopBurst = useCallback(() => { burstHoldRef.current = false; }, []);
 
-  // Timer → Scan
   const onShutter = useCallback(() => {
+    if (appState !== "idle") return;
     const timerVal = TIMERS[timerIdx];
     if (timerVal === 0) { doScan(); return; }
     setAppState("timer");
@@ -283,7 +356,7 @@ export default function CameraScreen() {
         doScan();
       }
     }, 1000);
-  }, [timerIdx, doScan, timerAnim]);
+  }, [timerIdx, doScan, timerAnim, appState]);
 
   const toggleFacing = useCallback(() => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -292,13 +365,16 @@ export default function CameraScreen() {
 
   const cycleFlash = useCallback(() => {
     if (isNight) { setTorch((t) => !t); return; }
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setFlash((f) => f === "off" ? "on" : f === "on" ? "auto" : "off");
   }, [isNight]);
 
   const cycleTimer = useCallback(() => {
     Haptics.selectionAsync();
     setTimerIdx((i) => (i + 1) % TIMERS.length);
+  }, []);
+
+  const goToGallery = useCallback(() => {
+    router.push("/gallery");
   }, []);
 
   const flashIcon = isNight
@@ -331,20 +407,16 @@ export default function CameraScreen() {
   const isProcessing = appState === "processing" || appState === "done";
   const isBurst = appState === "burst";
   const isTimerMode = appState === "timer";
+  const isError = appState === "error";
 
   return (
     <View style={styles.container}>
       <StatusBar style="light" hidden />
       <ImageProcessorView ref={processorRef} />
 
-      {/* Viewfinder + pinch zoom */}
+      {/* Viewfinder — GestureDetector ONLY covers the camera, not UI */}
       <GestureDetector gesture={pinchGesture}>
-        <Pressable
-          style={StyleSheet.absoluteFill}
-          onLongPress={doBurst}
-          onPressOut={stopBurst}
-          delayLongPress={400}
-        >
+        <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
           <CameraView
             ref={cameraRef}
             style={StyleSheet.absoluteFill}
@@ -353,10 +425,10 @@ export default function CameraScreen() {
             zoom={zoom}
             enableTorch={torch}
           />
-        </Pressable>
+        </View>
       </GestureDetector>
 
-      {/* Night mode vignette */}
+      {/* Night vignette */}
       {isNight && (
         <View style={styles.nightVignette} pointerEvents="none" />
       )}
@@ -377,7 +449,7 @@ export default function CameraScreen() {
 
       {/* Zoom badge */}
       {zoom > 0.05 && (
-        <View style={[styles.zoomBadge, { top: topPad + 64 }]}>
+        <View style={[styles.zoomBadge, { top: topPad + 64 }]} pointerEvents="none">
           <Text style={styles.zoomText}>{(1 + zoom * 9).toFixed(1)}×</Text>
         </View>
       )}
@@ -386,9 +458,7 @@ export default function CameraScreen() {
       {showExposure && isIdle && (
         <View style={[styles.exposureSliderContainer, { top: topPad + 60 }]} {...exposurePR.panHandlers}>
           <View style={styles.exposureTrack}>
-            <View style={[styles.exposureThumb, {
-              top: `${50 - exposure * 45}%` as any,
-            }]} />
+            <View style={[styles.exposureThumb, { top: `${50 - exposure * 45}%` as any }]} />
           </View>
           <Text style={styles.exposureLabel}>
             {exposure > 0 ? `+${exposure.toFixed(1)}` : exposure.toFixed(1)} EV
@@ -399,12 +469,9 @@ export default function CameraScreen() {
       {/* ── TOP BAR ── */}
       {isIdle && (
         <View style={[styles.topBar, { paddingTop: topPad + 8 }]}>
-          {/* Flash / Torch */}
           <TouchableOpacity style={styles.iconBtn} onPress={cycleFlash}>
             <Ionicons name={flashIcon as any} size={22} color={isNight && torch ? "#FFD700" : "#fff"} />
           </TouchableOpacity>
-
-          {/* Timer */}
           <TouchableOpacity style={styles.iconBtn} onPress={cycleTimer}>
             <MaterialCommunityIcons
               name={timerLabel as any}
@@ -412,32 +479,15 @@ export default function CameraScreen() {
               color={TIMERS[timerIdx] > 0 ? "#00BFFF" : "#fff"}
             />
           </TouchableOpacity>
-
-          {/* Logo */}
           <View style={styles.logoBox}>
             <Text style={styles.logoText}>glory cam</Text>
             {isNight && <Text style={styles.nightBadge}>NIGHT</Text>}
           </View>
-
-          {/* Grid */}
           <TouchableOpacity style={styles.iconBtn} onPress={() => setShowGrid((g) => !g)}>
-            <MaterialCommunityIcons
-              name="grid"
-              size={22}
-              color={showGrid ? "#00BFFF" : "#fff"}
-            />
+            <MaterialCommunityIcons name="grid" size={22} color={showGrid ? "#00BFFF" : "#fff"} />
           </TouchableOpacity>
-
-          {/* Exposure */}
-          <TouchableOpacity
-            style={styles.iconBtn}
-            onPress={() => setShowExposure((e) => !e)}
-          >
-            <Ionicons
-              name="sunny-outline"
-              size={22}
-              color={showExposure ? "#00BFFF" : "#fff"}
-            />
+          <TouchableOpacity style={styles.iconBtn} onPress={() => setShowExposure((e) => !e)}>
+            <Ionicons name="sunny-outline" size={22} color={showExposure ? "#00BFFF" : "#fff"} />
           </TouchableOpacity>
         </View>
       )}
@@ -452,9 +502,9 @@ export default function CameraScreen() {
         </TouchableOpacity>
       )}
 
-      {/* ── TIMER COUNTDOWN ── */}
+      {/* Timer Countdown */}
       {isTimerMode && (
-        <View style={[StyleSheet.absoluteFill, styles.timerOverlay]}>
+        <View style={[StyleSheet.absoluteFill, styles.timerOverlay]} pointerEvents="none">
           <Animated.Text style={[styles.timerNumber, { transform: [{ scale: timerAnim }] }]}>
             {timerSecondsLeft}
           </Animated.Text>
@@ -462,9 +512,9 @@ export default function CameraScreen() {
         </View>
       )}
 
-      {/* ── SCANNING OVERLAY ── */}
+      {/* Scanning Overlay */}
       {isScanning && (
-        <View style={[StyleSheet.absoluteFill, styles.scanOverlay]}>
+        <View style={[StyleSheet.absoluteFill, styles.scanOverlay]} pointerEvents="none">
           <Animated.View
             style={[styles.scanLine, {
               transform: [{
@@ -501,9 +551,9 @@ export default function CameraScreen() {
         </View>
       )}
 
-      {/* ── BURST OVERLAY ── */}
+      {/* Burst Overlay */}
       {isBurst && (
-        <View style={[StyleSheet.absoluteFill, styles.burstOverlay]}>
+        <View style={[StyleSheet.absoluteFill, styles.burstOverlay]} pointerEvents="none">
           <View style={[styles.burstBadge, { top: topPad + 16 }]}>
             <MaterialCommunityIcons name="camera-burst" size={20} color="#fff" />
             <Text style={styles.burstText}>BURST  {burstCount}</Text>
@@ -511,9 +561,9 @@ export default function CameraScreen() {
         </View>
       )}
 
-      {/* ── PROCESSING OVERLAY ── */}
+      {/* Processing Overlay */}
       {isProcessing && (
-        <View style={[StyleSheet.absoluteFill, styles.processingOverlay]}>
+        <View style={[StyleSheet.absoluteFill, styles.processingOverlay]} pointerEvents="none">
           <View style={styles.processingCard}>
             <Text style={styles.processingTitle}>
               {appState === "done" ? "✓ Saved!" : "AI Enhancing..."}
@@ -540,7 +590,17 @@ export default function CameraScreen() {
         </View>
       )}
 
-      {/* ── COLOR FILTER BAR ── */}
+      {/* Error */}
+      {isError && (
+        <View style={[StyleSheet.absoluteFill, styles.errorOverlay]} pointerEvents="none">
+          <View style={styles.errorCard}>
+            <Ionicons name="alert-circle-outline" size={32} color="#ef4444" />
+            <Text style={styles.errorText}>{errorMsg}</Text>
+          </View>
+        </View>
+      )}
+
+      {/* Color Filter Bar */}
       {isIdle && showFilters && (
         <View style={[styles.filterBar, { bottom: bottomPad + 190 }]}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 10, paddingHorizontal: 16 }}>
@@ -557,7 +617,7 @@ export default function CameraScreen() {
         </View>
       )}
 
-      {/* ── MODE BAR ── */}
+      {/* Mode Bar */}
       {isIdle && (
         <View style={[styles.modeBar, { bottom: bottomPad + 148 }]}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.modeContent}>
@@ -575,29 +635,51 @@ export default function CameraScreen() {
         </View>
       )}
 
-      {/* ── BOTTOM CONTROLS ── */}
+      {/* ── BOTTOM CONTROLS — rendered last so they are on top of everything ── */}
       {isIdle && (
         <View style={[styles.bottomBar, { paddingBottom: bottomPad + 16 }]}>
-          {/* Gallery thumbnail */}
-          <TouchableOpacity style={styles.thumbnailBtn} onPress={() => router.push("/gallery")}>
+          {/* Gallery thumbnail — dedicated TouchableOpacity, z-index handled by render order */}
+          <TouchableOpacity
+            style={styles.thumbnailBtn}
+            onPress={goToGallery}
+            activeOpacity={0.7}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+          >
             {lastPhoto
               ? <Image source={{ uri: lastPhoto }} style={styles.thumbnail} />
-              : <View style={styles.thumbnailEmpty}><Ionicons name="images-outline" size={22} color="#fff" /></View>}
+              : <View style={styles.thumbnailEmpty}>
+                  <Ionicons name="images-outline" size={22} color="#fff" />
+                </View>}
           </TouchableOpacity>
 
-          {/* Shutter */}
-          <TouchableOpacity style={[styles.shutterOuter, isNight && styles.shutterNight]} onPress={onShutter} activeOpacity={0.85}>
+          {/* Shutter — long press for burst, tap for scan */}
+          <TouchableOpacity
+            style={[styles.shutterOuter, isNight && styles.shutterNight]}
+            onPress={onShutter}
+            onLongPress={doBurst}
+            onPressOut={stopBurst}
+            delayLongPress={500}
+            activeOpacity={0.85}
+          >
             <View style={styles.shutterInnerOuter}>
               <View style={[styles.shutterInner, mode === "VIDEO" && styles.shutterVideo, isNight && styles.shutterInnerNight]} />
             </View>
           </TouchableOpacity>
 
-          {/* Filters toggle + flip */}
+          {/* Filter toggle + flip */}
           <View style={{ alignItems: "center", gap: 8 }}>
-            <TouchableOpacity style={styles.iconBtnSm} onPress={() => setShowFilters((f) => !f)}>
+            <TouchableOpacity
+              style={styles.iconBtnSm}
+              onPress={() => setShowFilters((f) => !f)}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
               <MaterialCommunityIcons name="palette-outline" size={22} color={showFilters ? "#00BFFF" : "#fff"} />
             </TouchableOpacity>
-            <TouchableOpacity style={styles.iconBtnSm} onPress={toggleFacing}>
+            <TouchableOpacity
+              style={styles.iconBtnSm}
+              onPress={toggleFacing}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
               <MaterialIcons name="flip-camera-ios" size={26} color="#fff" />
             </TouchableOpacity>
           </View>
@@ -639,49 +721,43 @@ const styles = StyleSheet.create({
   loading: { flex: 1, backgroundColor: "#000" },
 
   permContainer: { flex: 1, backgroundColor: "#000", alignItems: "center", justifyContent: "center", paddingHorizontal: 32, gap: 16 },
-  permTitle: { color: "#fff", fontSize: 24, fontWeight: "700", fontFamily: "Inter_700Bold" },
-  permSub: { color: "rgba(255,255,255,0.5)", fontSize: 15, textAlign: "center", lineHeight: 22, fontFamily: "Inter_400Regular" },
+  permTitle: { color: "#fff", fontSize: 24, fontWeight: "700" },
+  permSub: { color: "rgba(255,255,255,0.5)", fontSize: 15, textAlign: "center", lineHeight: 22 },
   permBtn: { marginTop: 8, backgroundColor: "#00BFFF", paddingHorizontal: 36, paddingVertical: 14, borderRadius: 30 },
-  permBtnText: { color: "#000", fontSize: 16, fontWeight: "700", fontFamily: "Inter_700Bold" },
+  permBtnText: { color: "#000", fontSize: 16, fontWeight: "700" },
 
-  nightVignette: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "transparent",
-    borderWidth: 40,
-    borderColor: "rgba(0,0,50,0.18)",
-    borderRadius: 0,
-  },
+  nightVignette: { ...StyleSheet.absoluteFillObject, borderWidth: 40, borderColor: "rgba(0,0,50,0.18)" },
 
   gridOverlay: { zIndex: 5 },
   gridRow: { flex: 1, flexDirection: "row", justifyContent: "space-evenly" },
-  gridLine: { width: 1, backgroundColor: "rgba(255,255,255,0.2)", flex: 0 },
+  gridLine: { width: 1, backgroundColor: "rgba(255,255,255,0.2)" },
   gridCol: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "space-evenly" },
   gridLineH: { height: 1, backgroundColor: "rgba(255,255,255,0.2)" },
 
-  zoomBadge: { position: "absolute", alignSelf: "center", backgroundColor: "rgba(0,0,0,0.55)", paddingHorizontal: 12, paddingVertical: 5, borderRadius: 14, zIndex: 20 },
-  zoomText: { color: "#fff", fontSize: 14, fontWeight: "600", fontFamily: "Inter_600SemiBold" },
+  zoomBadge: { position: "absolute", alignSelf: "center", backgroundColor: "rgba(0,0,0,0.55)", paddingHorizontal: 12, paddingVertical: 5, borderRadius: 14 },
+  zoomText: { color: "#fff", fontSize: 14, fontWeight: "600" },
 
   exposureSliderContainer: { position: "absolute", right: 16, zIndex: 30, alignItems: "center", gap: 8 },
-  exposureTrack: { width: 6, height: 140, backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 3, justifyContent: "center" },
-  exposureThumb: { position: "absolute", width: 18, height: 18, borderRadius: 9, backgroundColor: "#FFD700", left: -6, shadowColor: "#FFD700", shadowOpacity: 0.8, shadowRadius: 6 },
-  exposureLabel: { color: "#FFD700", fontSize: 11, fontWeight: "600", fontFamily: "Inter_600SemiBold" },
+  exposureTrack: { width: 6, height: 140, backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 3 },
+  exposureThumb: { position: "absolute", width: 18, height: 18, borderRadius: 9, backgroundColor: "#FFD700", left: -6 },
+  exposureLabel: { color: "#FFD700", fontSize: 11, fontWeight: "600" },
 
-  topBar: { position: "absolute", top: 0, left: 0, right: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingBottom: 12, zIndex: 10 },
+  topBar: { position: "absolute", top: 0, left: 0, right: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingBottom: 12, zIndex: 20 },
   iconBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: "rgba(0,0,0,0.4)", alignItems: "center", justifyContent: "center" },
   iconBtnSm: { width: 44, height: 44, borderRadius: 22, backgroundColor: "rgba(255,255,255,0.12)", alignItems: "center", justifyContent: "center" },
   logoBox: { alignItems: "center" },
-  logoText: { color: "#fff", fontSize: 14, fontWeight: "600", letterSpacing: 1.5, fontFamily: "Inter_600SemiBold" },
-  nightBadge: { color: "#FFD700", fontSize: 9, letterSpacing: 2, fontFamily: "Inter_700Bold", fontWeight: "700" },
+  logoText: { color: "#fff", fontSize: 14, fontWeight: "600", letterSpacing: 1.5 },
+  nightBadge: { color: "#FFD700", fontSize: 9, letterSpacing: 2, fontWeight: "700" },
 
-  qualityBadge: { position: "absolute", left: 16, backgroundColor: "rgba(0,191,255,0.18)", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, borderWidth: 1, borderColor: "rgba(0,191,255,0.35)", zIndex: 10 },
-  qualityText: { color: "#00BFFF", fontSize: 10, fontWeight: "700", fontFamily: "Inter_700Bold", letterSpacing: 1 },
+  qualityBadge: { position: "absolute", left: 16, backgroundColor: "rgba(0,191,255,0.18)", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, borderWidth: 1, borderColor: "rgba(0,191,255,0.35)", zIndex: 20 },
+  qualityText: { color: "#00BFFF", fontSize: 10, fontWeight: "700", letterSpacing: 1 },
 
   timerOverlay: { alignItems: "center", justifyContent: "center", backgroundColor: "rgba(0,0,0,0.6)", zIndex: 20 },
-  timerNumber: { color: "#fff", fontSize: 120, fontWeight: "700", fontFamily: "Inter_700Bold" },
-  timerSub: { color: "rgba(255,255,255,0.6)", fontSize: 16, fontFamily: "Inter_400Regular" },
+  timerNumber: { color: "#fff", fontSize: 120, fontWeight: "700" },
+  timerSub: { color: "rgba(255,255,255,0.6)", fontSize: 16 },
 
   scanOverlay: { alignItems: "center", justifyContent: "center", zIndex: 10 },
-  scanLine: { width: "100%", height: 2, backgroundColor: "#00BFFF", shadowColor: "#00BFFF", shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.9, shadowRadius: 8, elevation: 4 },
+  scanLine: { width: "100%", height: 2, backgroundColor: "#00BFFF", shadowColor: "#00BFFF", shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.9, shadowRadius: 8 },
   corner: { position: "absolute", width: 26, height: 26, borderColor: "#00BFFF" },
   cTL: { top: "20%", left: "10%", borderTopWidth: 2.5, borderLeftWidth: 2.5 },
   cTR: { top: "20%", right: "10%", borderTopWidth: 2.5, borderRightWidth: 2.5 },
@@ -691,49 +767,54 @@ const styles = StyleSheet.create({
   scanBadge: { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "rgba(0,191,255,0.18)", paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, borderWidth: 1, borderColor: "rgba(0,191,255,0.4)" },
   scanDot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: "#00BFFF" },
   scanDotNight: { backgroundColor: "#FFD700" },
-  scanBadgeText: { color: "#00BFFF", fontSize: 11, fontWeight: "700", letterSpacing: 1.5, fontFamily: "Inter_700Bold" },
+  scanBadgeText: { color: "#00BFFF", fontSize: 11, fontWeight: "700", letterSpacing: 1.5 },
   scanBadgeNight: { color: "#FFD700" },
-  scanTimer: { color: "#fff", fontSize: 36, fontWeight: "700", fontFamily: "Inter_700Bold" },
+  scanTimer: { color: "#fff", fontSize: 36, fontWeight: "700" },
   scanInfoBottom: { position: "absolute", left: 0, right: 0, alignItems: "center", gap: 10 },
-  scanHint: { color: "rgba(255,255,255,0.6)", fontSize: 13, fontFamily: "Inter_400Regular" },
+  scanHint: { color: "rgba(255,255,255,0.6)", fontSize: 13 },
   frameDots: { flexDirection: "row", gap: 8 },
   frameDot: { width: 12, height: 12, borderRadius: 6, borderWidth: 1.5, borderColor: "rgba(255,255,255,0.4)" },
   frameDotFilled: { backgroundColor: "#00BFFF", borderColor: "#00BFFF" },
-  frameLabel: { color: "rgba(255,255,255,0.5)", fontSize: 12, fontFamily: "Inter_400Regular" },
+  frameLabel: { color: "rgba(255,255,255,0.5)", fontSize: 12 },
 
   burstOverlay: { zIndex: 10 },
   burstBadge: { position: "absolute", left: 0, right: 0, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8 },
-  burstText: { color: "#fff", fontSize: 18, fontWeight: "700", fontFamily: "Inter_700Bold", letterSpacing: 2 },
+  burstText: { color: "#fff", fontSize: 18, fontWeight: "700", letterSpacing: 2 },
 
   processingOverlay: { alignItems: "center", justifyContent: "center", backgroundColor: "rgba(0,0,0,0.9)", zIndex: 20 },
   processingCard: { width: "82%", backgroundColor: "#0e0e0e", borderRadius: 20, padding: 24, gap: 20, borderWidth: 1, borderColor: "rgba(0,191,255,0.18)" },
-  processingTitle: { color: "#fff", fontSize: 18, fontWeight: "700", fontFamily: "Inter_700Bold", textAlign: "center" },
+  processingTitle: { color: "#fff", fontSize: 18, fontWeight: "700", textAlign: "center" },
   stepsList: { gap: 14 },
   stepRow: { flexDirection: "row", alignItems: "center", gap: 12 },
   stepIcon: { width: 22, height: 22, borderRadius: 11, backgroundColor: "rgba(255,255,255,0.06)", alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: "rgba(255,255,255,0.12)" },
   stepIconDone: { backgroundColor: "#00BFFF", borderColor: "#00BFFF" },
   stepIconActive: { borderColor: "#00BFFF", backgroundColor: "rgba(0,191,255,0.1)" },
   stepDotEmpty: { width: 6, height: 6, borderRadius: 3, backgroundColor: "rgba(255,255,255,0.15)" },
-  stepLabel: { color: "rgba(255,255,255,0.3)", fontSize: 12, fontFamily: "Inter_400Regular", flex: 1 },
+  stepLabel: { color: "rgba(255,255,255,0.3)", fontSize: 12, flex: 1 },
   stepLabelActive: { color: "#fff" },
   stepLabelDone: { color: "rgba(255,255,255,0.55)" },
 
-  filterBar: { position: "absolute", left: 0, right: 0, zIndex: 10 },
+  errorOverlay: { alignItems: "center", justifyContent: "center", backgroundColor: "rgba(0,0,0,0.75)", zIndex: 20 },
+  errorCard: { backgroundColor: "#1a0505", borderRadius: 16, padding: 24, alignItems: "center", gap: 12, borderWidth: 1, borderColor: "rgba(239,68,68,0.3)" },
+  errorText: { color: "#ef4444", fontSize: 14, textAlign: "center" },
+
+  filterBar: { position: "absolute", left: 0, right: 0, zIndex: 15 },
   filterChip: { paddingHorizontal: 14, paddingVertical: 6, borderRadius: 16, borderWidth: 1, borderColor: "rgba(255,255,255,0.2)", backgroundColor: "rgba(0,0,0,0.4)" },
   filterChipActive: { backgroundColor: "rgba(0,191,255,0.22)", borderColor: "#00BFFF" },
-  filterLabel: { color: "rgba(255,255,255,0.6)", fontSize: 12, fontWeight: "600", fontFamily: "Inter_600SemiBold" },
+  filterLabel: { color: "rgba(255,255,255,0.6)", fontSize: 12, fontWeight: "600" },
   filterLabelActive: { color: "#00BFFF" },
 
-  modeBar: { position: "absolute", left: 0, right: 0, zIndex: 10 },
+  modeBar: { position: "absolute", left: 0, right: 0, zIndex: 15 },
   modeContent: { paddingHorizontal: 32, gap: 4 },
   modeItem: { alignItems: "center", paddingHorizontal: 14, paddingVertical: 6 },
-  modeText: { color: "rgba(255,255,255,0.5)", fontSize: 12, fontWeight: "600", letterSpacing: 1.2, fontFamily: "Inter_600SemiBold" },
+  modeText: { color: "rgba(255,255,255,0.5)", fontSize: 12, fontWeight: "600", letterSpacing: 1.2 },
   modeTextActive: { color: "#fff", fontSize: 13 },
   modeDot: { width: 4, height: 4, borderRadius: 2, backgroundColor: "#00BFFF", marginTop: 3 },
   modeDotNight: { backgroundColor: "#FFD700" },
 
-  bottomBar: { position: "absolute", bottom: 0, left: 0, right: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 32, zIndex: 10 },
-  thumbnailBtn: { width: 54, height: 54, borderRadius: 12, overflow: "hidden", borderWidth: 1.5, borderColor: "rgba(255,255,255,0.35)" },
+  // Bottom bar — rendered last = highest touch priority on Android
+  bottomBar: { position: "absolute", bottom: 0, left: 0, right: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 32, zIndex: 25 },
+  thumbnailBtn: { width: 58, height: 58, borderRadius: 12, overflow: "hidden", borderWidth: 2, borderColor: "rgba(255,255,255,0.4)" },
   thumbnail: { width: "100%", height: "100%" },
   thumbnailEmpty: { flex: 1, backgroundColor: "rgba(255,255,255,0.1)", alignItems: "center", justifyContent: "center" },
   shutterOuter: { width: 80, height: 80, borderRadius: 40, borderWidth: 3, borderColor: "#fff", alignItems: "center", justifyContent: "center" },
