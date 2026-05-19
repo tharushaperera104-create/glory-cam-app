@@ -23,6 +23,19 @@
       }
     },
     "android": {
+  "package": "com.tharushaperera.glorycam",
+  "icon": "./assets/images/icon.png",
+  "adaptiveIcon": {
+    "foregroundImage": "./assets/images/icon.png",
+    "backgroundColor": "#000000"
+  },
+  "permissions": [
+    "android.permission.CAMERA",
+    "android.permission.READ_MEDIA_IMAGES",
+    "android.permission.WRITE_EXTERNAL_STORAGE",
+    "android.permission.READ_EXTERNAL_STORAGE"
+  ]
+},
       "icon": "./assets/images/icon.png",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/icon.png",
